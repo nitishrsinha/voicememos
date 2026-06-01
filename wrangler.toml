@@ -1,0 +1,34 @@
+name = "voicememos"
+main = "src/worker.js"
+compatibility_date = "2026-04-22"
+workers_dev = true
+
+# Add a route after you pick a hostname, for example:
+# routes = [
+#   { pattern = "voice.example.com", zone_name = "example.com", custom_domain = true }
+# ]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "voicememos-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[ai]
+binding = "AI"
+
+[vars]
+APP_NAME = "Voice Memos"
+OWNER_EMAIL = "you@example.com"
+OWNER_TIMEZONE = "America/New_York"
+REPORT_HOUR_LOCAL = "20"
+SUMMARY_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
+RESEND_FROM_EMAIL = "Voice Memos <memos@example.com>"
+
+[triggers]
+crons = ["*/30 * * * *"]
+
+# Required secrets:
+#   VOICE_PASSWORD_HASH     pbkdf2_sha256$iterations$salt_base64url$hash_base64url
+#   VOICE_TOTP_SECRET       base32 secret from authenticator setup
+#   VOICE_SESSION_SECRET    long random string
+#   RESEND_API_KEY

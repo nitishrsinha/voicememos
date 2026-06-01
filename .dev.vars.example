@@ -1,0 +1,13 @@
+# Copy to .dev.vars for local development. Do not commit .dev.vars.
+
+APP_NAME="Voice Memos"
+OWNER_EMAIL="you@example.com"
+OWNER_TIMEZONE="America/New_York"
+REPORT_HOUR_LOCAL="20"
+SUMMARY_MODEL="@cf/qwen/qwen3-30b-a3b-fp8"
+RESEND_FROM_EMAIL="Voice Memos <memos@example.com>"
+
+VOICE_PASSWORD_HASH=""
+VOICE_TOTP_SECRET=""
+VOICE_SESSION_SECRET=""
+RESEND_API_KEY=""
