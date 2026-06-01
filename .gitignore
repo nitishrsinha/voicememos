@@ -2,4 +2,6 @@ node_modules/
 .wrangler/
 .dev.vars
 .env
+.deploy.env
+wrangler.local.toml
 *.log
