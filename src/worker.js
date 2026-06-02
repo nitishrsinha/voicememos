@@ -56,8 +56,15 @@ async function routeRequest(request, env, ctx) {
   if (url.pathname === "/api/memos/today" && request.method === "GET") {
     return handleTodayMemos(env);
   }
+  if (url.pathname === "/api/memos/diary" && request.method === "GET") {
+    return handleDiaryMemos(env, url);
+  }
   if (url.pathname === "/api/memos/day" && request.method === "DELETE") {
     return handleDeleteDay(env);
+  }
+  if (url.pathname.startsWith("/api/memos/") && request.method === "PATCH") {
+    const id = decodeURIComponent(url.pathname.slice("/api/memos/".length));
+    return handleUpdateMemo(request, env, id);
   }
   if (url.pathname.startsWith("/api/memos/") && request.method === "DELETE") {
     const id = decodeURIComponent(url.pathname.slice("/api/memos/".length));
@@ -152,10 +159,48 @@ async function handleTodayMemos(env) {
   return json({ ok: true, local_date: localDate, memos });
 }
 
+async function handleDiaryMemos(env, url) {
+  const localDate = todayLocal(env);
+  const memos = await listDiaryMemos(env, localDate, parseDiaryFilters(url));
+  return json({ ok: true, before_date: localDate, memos });
+}
+
 async function handleDeleteMemo(env, id) {
   if (!id) return json({ error: "Memo id is required." }, 400);
   const result = await env.DB.prepare("DELETE FROM voice_memos WHERE id = ?").bind(id).run();
   return json({ ok: true, deleted: result.meta?.changes || 0 });
+}
+
+async function handleUpdateMemo(request, env, id) {
+  if (!id) return json({ error: "Memo id is required." }, 400);
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON." }, 400);
+  }
+
+  const transcript = String(body.transcript || "").trim();
+  if (!transcript) return json({ error: "Memo text is required." }, 400);
+  const mode = normalizeMode(body.mode);
+
+  const result = await env.DB.prepare(
+    "UPDATE voice_memos SET transcript = ?, mode = ? WHERE id = ?"
+  ).bind(transcript, mode, id).run();
+
+  if (!(result.meta?.changes || 0)) {
+    return json({ error: "Memo not found." }, 404);
+  }
+
+  const memo = await env.DB.prepare(`
+    SELECT id, created_at, local_date, transcript, duration_seconds, mode, source, included_in_report_id
+    FROM voice_memos
+    WHERE id = ?
+    LIMIT 1
+  `).bind(id).first();
+
+  return json({ ok: true, memo });
 }
 
 async function handleDeleteDay(env) {
@@ -291,6 +336,58 @@ async function listMemosForDate(env, localDate) {
     ORDER BY created_at ASC
   `).bind(localDate).all();
   return results || [];
+}
+
+function parseDiaryFilters(url) {
+  const q = String(url.searchParams.get("q") || "").trim().slice(0, 120);
+  const modeParam = String(url.searchParams.get("mode") || "").trim();
+  const mode = MODES.has(modeParam) ? modeParam : "";
+  const from = parseIsoDateParam(url.searchParams.get("from"));
+  const to = parseIsoDateParam(url.searchParams.get("to"));
+  return { q, mode, from, to };
+}
+
+async function listDiaryMemos(env, beforeDate, filters = {}) {
+  const clauses = ["local_date < ?"];
+  const values = [beforeDate];
+
+  if (filters.q) {
+    clauses.push("transcript LIKE ? ESCAPE '\\\\'");
+    values.push(`%${escapeSqlLike(filters.q)}%`);
+  }
+
+  if (filters.mode) {
+    clauses.push("mode = ?");
+    values.push(filters.mode);
+  }
+
+  if (filters.from) {
+    clauses.push("local_date >= ?");
+    values.push(filters.from);
+  }
+
+  if (filters.to) {
+    clauses.push("local_date <= ?");
+    values.push(filters.to);
+  }
+
+  const { results } = await env.DB.prepare(`
+    SELECT id, created_at, local_date, transcript, duration_seconds, mode, source, included_in_report_id
+    FROM voice_memos
+    WHERE ${clauses.join(" AND ")}
+    ORDER BY local_date DESC, created_at ASC
+    LIMIT 200
+  `).bind(...values).all();
+  return results || [];
+}
+
+function escapeSqlLike(value) {
+  return String(value || "").replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+function parseIsoDateParam(value) {
+  const date = String(value || "").trim();
+  return /^\\d{4}-\\d{2}-\\d{2}$/.test(date) ? date : "";
 }
 
 async function sendEmail(env, { to, subject, text }) {
@@ -604,38 +701,80 @@ function appPage(env) {
   </header>
 
   <main class="shell">
-    <section class="recorder">
-      <select id="mode">
-        <option value="free">Free note</option>
-        <option value="summary">Summarize back</option>
-        <option value="key_points">Key points</option>
-        <option value="todos">Todos</option>
-        <option value="draft">Draft</option>
-        <option value="journal">Journal</option>
-      </select>
-      <button id="record" class="record" type="button">Record</button>
-      <div id="timer" class="timer">00:00</div>
-      <div id="status" class="status"></div>
+    <nav class="tabs" aria-label="Memo views">
+      <button id="todayTab" class="tab is-active" type="button" data-view="today">Today</button>
+      <button id="diaryTab" class="tab" type="button" data-view="diary">Diary</button>
+    </nav>
+
+    <section id="todayView" class="tab-view is-active">
+      <div class="recorder">
+        <select id="mode">
+          <option value="free">Free note</option>
+          <option value="summary">Summarize back</option>
+          <option value="key_points">Key points</option>
+          <option value="todos">Todos</option>
+          <option value="draft">Draft</option>
+          <option value="journal">Journal</option>
+        </select>
+        <button id="record" class="record" type="button">Record</button>
+        <div id="timer" class="timer">00:00</div>
+        <div id="status" class="status"></div>
+      </div>
+
+      <div class="manual">
+        <textarea id="textMemo" placeholder="Type a memo if recording is not convenient"></textarea>
+        <button id="saveText" type="button">Save text memo</button>
+      </div>
+
+      <div class="actions">
+        <select id="reportModel">
+          <option value="llama">Llama</option>
+          <option value="qwen">Qwen</option>
+          <option value="kimi">Kimi</option>
+        </select>
+        <button id="sendReport" type="button">Send today's report now</button>
+        <button id="deleteDay" class="danger" type="button">Delete unsent memos today</button>
+      </div>
+
+      <div class="panel">
+        <h2>Today</h2>
+        <div id="memos" class="memos"></div>
+      </div>
     </section>
 
-    <section class="manual">
-      <textarea id="textMemo" placeholder="Type a memo if recording is not convenient"></textarea>
-      <button id="saveText" type="button">Save text memo</button>
-    </section>
-
-    <section class="actions">
-      <select id="reportModel">
-        <option value="llama">Llama</option>
-        <option value="qwen">Qwen</option>
-        <option value="kimi">Kimi</option>
-      </select>
-      <button id="sendReport" type="button">Send today's report now</button>
-      <button id="deleteDay" class="danger" type="button">Delete unsent memos today</button>
-    </section>
-
-    <section>
-      <h2>Today</h2>
-      <div id="memos" class="memos"></div>
+    <section id="diaryView" class="tab-view" hidden>
+      <div class="diary-header">
+        <h2>Diary</h2>
+        <p>Older memos grouped by year and month.</p>
+      </div>
+      <div class="diary-filters">
+        <label>
+          <span>Search</span>
+          <input id="diarySearch" type="search" placeholder="Search old entries">
+        </label>
+        <label>
+          <span>Category</span>
+          <select id="diaryMode">
+            <option value="">All categories</option>
+            <option value="free">Free note</option>
+            <option value="summary">Summarize back</option>
+            <option value="key_points">Key points</option>
+            <option value="todos">Todos</option>
+            <option value="draft">Draft</option>
+            <option value="journal">Journal</option>
+          </select>
+        </label>
+        <label>
+          <span>From</span>
+          <input id="diaryFrom" type="date">
+        </label>
+        <label>
+          <span>To</span>
+          <input id="diaryTo" type="date">
+        </label>
+        <button id="clearDiaryFilters" class="ghost" type="button">Clear</button>
+      </div>
+      <div id="diary" class="diary"></div>
     </section>
   </main>
 
@@ -644,12 +783,24 @@ function appPage(env) {
     var statusEl = document.getElementById("status");
     var timerEl = document.getElementById("timer");
     var memosEl = document.getElementById("memos");
+    var diaryEl = document.getElementById("diary");
     var modeEl = document.getElementById("mode");
+    var diarySearchEl = document.getElementById("diarySearch");
+    var diaryModeEl = document.getElementById("diaryMode");
+    var diaryFromEl = document.getElementById("diaryFrom");
+    var diaryToEl = document.getElementById("diaryTo");
+    var clearDiaryFiltersBtn = document.getElementById("clearDiaryFilters");
+    var tabs = document.querySelectorAll(".tab");
+    var views = {
+      today: document.getElementById("todayView"),
+      diary: document.getElementById("diaryView")
+    };
     var mediaRecorder = null;
     var stream = null;
     var chunks = [];
     var startedAt = 0;
     var tick = null;
+    var diarySearchTick = null;
 
     function setStatus(text, kind) {
       statusEl.textContent = text || "";
@@ -670,6 +821,35 @@ function appPage(env) {
       if (tick) clearInterval(tick);
       tick = null;
     }
+    function showView(name) {
+      tabs.forEach(function (tab) {
+        tab.classList.toggle("is-active", tab.dataset.view === name);
+      });
+      Object.keys(views).forEach(function (key) {
+        views[key].hidden = key !== name;
+        views[key].classList.toggle("is-active", key === name);
+      });
+      if (name === "diary") loadDiary();
+    }
+    tabs.forEach(function (tab) {
+      tab.addEventListener("click", function () {
+        showView(tab.dataset.view || "today");
+      });
+    });
+    diarySearchEl.addEventListener("input", function () {
+      if (diarySearchTick) clearTimeout(diarySearchTick);
+      diarySearchTick = setTimeout(loadDiary, 250);
+    });
+    diaryModeEl.addEventListener("change", loadDiary);
+    diaryFromEl.addEventListener("change", loadDiary);
+    diaryToEl.addEventListener("change", loadDiary);
+    clearDiaryFiltersBtn.addEventListener("click", function () {
+      diarySearchEl.value = "";
+      diaryModeEl.value = "";
+      diaryFromEl.value = "";
+      diaryToEl.value = "";
+      loadDiary();
+    });
     async function startRecording() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         setStatus("Microphone recording is not supported in this browser.", "error");
@@ -720,7 +900,7 @@ function appPage(env) {
         if (!response.ok) throw new Error(data.error || "Upload failed");
         setStatus("Saved", "ok");
         timerEl.textContent = "00:00";
-        loadToday();
+        loadAllMemos();
       } catch (error) {
         setStatus(error.message || "Upload failed", "error");
       }
@@ -740,7 +920,7 @@ function appPage(env) {
       });
       if (response.ok) {
         textarea.value = "";
-        loadToday();
+        loadAllMemos();
       }
     });
     document.getElementById("sendReport").addEventListener("click", async function () {
@@ -753,33 +933,279 @@ function appPage(env) {
     document.getElementById("deleteDay").addEventListener("click", async function () {
       if (!confirm("Delete today's unsent memos?")) return;
       await fetch("/api/memos/day", { method: "DELETE" });
-      loadToday();
+      loadAllMemos();
     });
     async function deleteMemo(id) {
       await fetch("/api/memos/" + encodeURIComponent(id), { method: "DELETE" });
-      loadToday();
+      loadAllMemos();
+    }
+    var modeOptions = [
+      ["free", "Free note"],
+      ["summary", "Summarize back"],
+      ["key_points", "Key points"],
+      ["todos", "Todos"],
+      ["draft", "Draft"],
+      ["journal", "Journal"]
+    ];
+    function modeLabel(value) {
+      var match = modeOptions.find(function (option) { return option[0] === value; });
+      return match ? match[1] : "Free note";
+    }
+    async function updateMemo(id, transcript, mode) {
+      var response = await fetch("/api/memos/" + encodeURIComponent(id), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transcript: transcript, mode: mode })
+      });
+      var data = await response.json().catch(function () { return {}; });
+      if (!response.ok) throw new Error(data.error || "Could not update memo.");
+      return data.memo;
+    }
+    function createMemoArticle(memo) {
+      var article = document.createElement("article");
+      article.className = "memo";
+      article.dataset.id = memo.id || "";
+      article.dataset.transcript = memo.transcript || "";
+      article.dataset.mode = memo.mode || "free";
+
+      var head = document.createElement("div");
+      head.className = "memo-head";
+
+      var mode = document.createElement("span");
+      mode.className = "memo-mode";
+      mode.textContent = modeLabel(memo.mode || "free");
+
+      var actions = document.createElement("div");
+      actions.className = "memo-actions";
+
+      var edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "memo-edit";
+      edit.textContent = "Edit";
+      edit.addEventListener("click", function () { startEditingMemo(article); });
+
+      var del = document.createElement("button");
+      del.type = "button";
+      del.className = "memo-delete";
+      del.textContent = "Delete";
+      del.addEventListener("click", function () { deleteMemo(memo.id); });
+
+      actions.appendChild(edit);
+      actions.appendChild(del);
+      head.appendChild(mode);
+      head.appendChild(actions);
+
+      var transcript = document.createElement("p");
+      transcript.textContent = memo.transcript || "";
+
+      article.appendChild(head);
+      article.appendChild(transcript);
+      return article;
+    }
+    function renderMemoList(container, memos, emptyText) {
+      container.innerHTML = "";
+      if (!memos || !memos.length) {
+        container.innerHTML = '<p class="empty">' + emptyText + '</p>';
+        return;
+      }
+      memos.forEach(function (memo) {
+        container.appendChild(createMemoArticle(memo));
+      });
+    }
+    function renderDiary(memos) {
+      diaryEl.innerHTML = "";
+      if (!memos || !memos.length) {
+        diaryEl.innerHTML = '<p class="empty">' + diaryEmptyText() + '</p>';
+        return;
+      }
+
+      var byYear = {};
+      memos.forEach(function (memo) {
+        var parts = parseLocalDate(memo.local_date);
+        var year = parts.year || "Earlier";
+        var month = parts.month || "Undated";
+        var date = memo.local_date || "Earlier";
+        if (!byYear[year]) byYear[year] = {};
+        if (!byYear[year][month]) byYear[year][month] = {};
+        if (!byYear[year][month][date]) byYear[year][month][date] = [];
+        byYear[year][month][date].push(memo);
+      });
+
+      Object.keys(byYear).forEach(function (year) {
+        var yearGroup = document.createElement("section");
+        yearGroup.className = "diary-year";
+
+        var yearHeading = document.createElement("h3");
+        yearHeading.textContent = year;
+        yearGroup.appendChild(yearHeading);
+
+        Object.keys(byYear[year]).forEach(function (month) {
+          var monthGroup = document.createElement("div");
+          monthGroup.className = "diary-month";
+
+          var monthHeading = document.createElement("h4");
+          monthHeading.textContent = month;
+          monthGroup.appendChild(monthHeading);
+
+          Object.keys(byYear[year][month]).forEach(function (date) {
+            var dayGroup = document.createElement("div");
+            dayGroup.className = "diary-day";
+
+            var dayHeading = document.createElement("h5");
+            dayHeading.textContent = formatDiaryDate(date);
+            dayGroup.appendChild(dayHeading);
+
+            byYear[year][month][date].forEach(function (memo) {
+              dayGroup.appendChild(createMemoArticle(memo));
+            });
+            monthGroup.appendChild(dayGroup);
+          });
+
+          yearGroup.appendChild(monthGroup);
+        });
+
+        diaryEl.appendChild(yearGroup);
+      });
+    }
+    function parseLocalDate(value) {
+      var match = String(value || "").match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+      if (!match) return { year: "", month: "" };
+      var date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+      return {
+        year: match[1],
+        month: date.toLocaleString(undefined, { month: "long" })
+      };
+    }
+    function formatDiaryDate(value) {
+      var match = String(value || "").match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+      if (!match) return value || "Earlier";
+      var date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+      return date.toLocaleDateString(undefined, {
+        weekday: "short",
+        month: "short",
+        day: "numeric"
+      });
+    }
+    function startEditingMemo(article) {
+      if (article.classList.contains("is-editing")) return;
+      var text = article.dataset.transcript || "";
+      var currentMode = article.dataset.mode || "free";
+      var body = article.querySelector("p");
+      var actions = article.querySelector(".memo-actions");
+
+      article.classList.add("is-editing");
+      body.hidden = true;
+      actions.innerHTML = "";
+
+      var category = document.createElement("select");
+      category.className = "memo-category";
+      modeOptions.forEach(function (option) {
+        var item = document.createElement("option");
+        item.value = option[0];
+        item.textContent = option[1];
+        category.appendChild(item);
+      });
+      category.value = currentMode;
+
+      var textarea = document.createElement("textarea");
+      textarea.className = "memo-editor";
+      textarea.value = text;
+
+      var save = document.createElement("button");
+      save.type = "button";
+      save.className = "memo-save";
+      save.textContent = "Save";
+
+      var cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "memo-cancel";
+      cancel.textContent = "Cancel";
+
+      save.addEventListener("click", async function () {
+        var updated = textarea.value.trim();
+        if (!updated) {
+          setStatus("Memo text is required.", "error");
+          textarea.focus();
+          return;
+        }
+        save.disabled = true;
+        try {
+          var memo = await updateMemo(article.dataset.id, updated, category.value);
+          article.dataset.transcript = memo.transcript || updated;
+          article.dataset.mode = memo.mode || category.value;
+          body.textContent = article.dataset.transcript;
+          article.querySelector(".memo-mode").textContent = modeLabel(article.dataset.mode);
+          setStatus("Memo updated", "ok");
+          finishEditingMemo(article, body, actions);
+        } catch (error) {
+          setStatus(error.message || "Could not update memo.", "error");
+          save.disabled = false;
+        }
+      });
+
+      cancel.addEventListener("click", function () {
+        finishEditingMemo(article, body, actions);
+      });
+
+      actions.appendChild(save);
+      actions.appendChild(cancel);
+      article.appendChild(category);
+      article.appendChild(textarea);
+      category.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }
+    function finishEditingMemo(article, body, actions) {
+      var category = article.querySelector(".memo-category");
+      var editor = article.querySelector(".memo-editor");
+      if (category) category.remove();
+      if (editor) editor.remove();
+      body.hidden = false;
+      article.classList.remove("is-editing");
+      actions.innerHTML = "";
+
+      var edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "memo-edit";
+      edit.textContent = "Edit";
+      edit.addEventListener("click", function () { startEditingMemo(article); });
+
+      var del = document.createElement("button");
+      del.type = "button";
+      del.className = "memo-delete";
+      del.textContent = "Delete";
+      del.addEventListener("click", function () { deleteMemo(article.dataset.id); });
+
+      actions.appendChild(edit);
+      actions.appendChild(del);
     }
     async function loadToday() {
       var response = await fetch("/api/memos/today", { cache: "no-store" });
       var data = await response.json();
       document.getElementById("todayLabel").textContent = data.local_date || "";
-      if (!data.memos || !data.memos.length) {
-        memosEl.innerHTML = '<p class="empty">No memos yet today.</p>';
-        return;
+      renderMemoList(memosEl, data.memos, "No memos yet today.");
+    }
+    async function loadDiary() {
+      var params = new URLSearchParams();
+      if (diarySearchEl.value.trim()) params.set("q", diarySearchEl.value.trim());
+      if (diaryModeEl.value) params.set("mode", diaryModeEl.value);
+      if (diaryFromEl.value) params.set("from", diaryFromEl.value);
+      if (diaryToEl.value) params.set("to", diaryToEl.value);
+      var url = "/api/memos/diary" + (params.toString() ? "?" + params.toString() : "");
+      var response = await fetch(url, { cache: "no-store" });
+      var data = await response.json();
+      renderDiary(data.memos);
+    }
+    function diaryEmptyText() {
+      if (diarySearchEl.value.trim() || diaryModeEl.value || diaryFromEl.value || diaryToEl.value) {
+        return "No diary entries match those filters.";
       }
-      memosEl.innerHTML = data.memos.map(function (memo) {
-        return '<article class="memo"><div class="memo-head"><span>' + escapeHtml(memo.mode || "free") + '</span><button data-id="' + escapeHtml(memo.id) + '">Delete</button></div><p>' + escapeHtml(memo.transcript || "") + '</p></article>';
-      }).join("");
-      memosEl.querySelectorAll("button[data-id]").forEach(function (button) {
-        button.addEventListener("click", function () { deleteMemo(button.getAttribute("data-id")); });
-      });
+      return "No previous diary entries yet.";
     }
-    function escapeHtml(value) {
-      return String(value || "").replace(/[&<>"']/g, function (ch) {
-        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[ch];
-      });
+    function loadAllMemos() {
+      loadToday();
+      loadDiary();
     }
-    loadToday();
+    loadAllMemos();
   </script>
 </body>
 </html>`;
@@ -795,8 +1221,13 @@ function styles() {
     h1 { margin:0; font-size:1.35rem; }
     h2 { margin:0 0 12px; font-size:1rem; }
     .topbar p { margin:4px 0 0; color:var(--muted); }
-    .shell { width:min(820px,100%); margin:0 auto; padding:20px clamp(16px,4vw,32px) 48px; display:grid; gap:18px; }
-    .recorder, .manual, .actions, section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    .shell { width:min(860px,100%); margin:0 auto; padding:20px clamp(16px,4vw,32px) 48px; display:grid; gap:18px; }
+    .recorder, .manual, .actions, .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    .tab-view { display:grid; gap:16px; }
+    .tab-view[hidden] { display:none; }
+    .tabs { display:flex; gap:6px; border-bottom:1px solid var(--line); }
+    .tab { background:transparent; color:var(--muted); border:1px solid transparent; border-bottom:0; border-radius:8px 8px 0 0; padding:10px 16px; }
+    .tab.is-active { background:var(--panel); color:var(--ink); border-color:var(--line); transform:translateY(1px); }
     .recorder { display:grid; grid-template-columns:1fr auto auto; align-items:center; gap:12px; }
     select, textarea, input { width:100%; border:1px solid var(--line); border-radius:8px; background:white; color:var(--ink); padding:11px 12px; }
     textarea { min-height:110px; resize:vertical; display:block; margin-bottom:10px; }
@@ -814,7 +1245,25 @@ function styles() {
     .memo:first-child { border-top:0; padding-top:0; }
     .memo p { margin:8px 0 0; white-space:pre-wrap; line-height:1.5; }
     .memo-head { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:.86rem; }
-    .memo-head button { background:transparent; color:var(--danger); border:1px solid var(--line); padding:6px 9px; }
+    .memo-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+    .memo-head button { background:transparent; color:var(--accent); border:1px solid var(--line); padding:6px 9px; }
+    .memo-head .memo-delete, .memo-head .memo-cancel { color:var(--danger); }
+    .memo-category { margin:10px 0 0; }
+    .memo-editor { min-height:120px; margin:10px 0 0; }
+    .diary-header { border-bottom:1px solid var(--line); padding-bottom:12px; }
+    .diary-header p { margin:4px 0 0; color:var(--muted); }
+    .diary-filters { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px; align-items:end; padding:12px 0 4px; border-bottom:1px solid var(--line); }
+    .diary-filters label { display:grid; gap:5px; }
+    .diary-filters span { color:var(--muted); font-size:.78rem; font-weight:700; }
+    .diary-filters button { min-height:43px; width:100%; }
+    .diary-year { padding-top:6px; }
+    .diary-year + .diary-year { border-top:2px solid var(--ink); margin-top:24px; padding-top:18px; }
+    .diary-year h3 { margin:0 0 16px; font-size:1.35rem; letter-spacing:0; }
+    .diary-month { border-top:1px solid var(--line); padding-top:14px; margin-top:14px; }
+    .diary-month h4 { margin:0 0 10px; color:var(--accent); font-size:1rem; letter-spacing:0; }
+    .diary-day { padding:10px 0 2px; }
+    .diary-day + .diary-day { border-top:1px solid var(--line); margin-top:10px; padding-top:14px; }
+    .diary-day h5 { margin:0 0 2px; color:var(--muted); font-size:.86rem; font-weight:700; letter-spacing:0; }
     .empty { color:var(--muted); margin:0; }
     .login-body { display:grid; place-items:center; padding:24px; }
     .login-panel { width:min(380px,100%); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:22px; }
@@ -824,6 +1273,7 @@ function styles() {
       .recorder { grid-template-columns:1fr; }
       .record { width:100%; height:72px; border-radius:8px; }
       .timer { text-align:left; }
+      .diary-filters { grid-template-columns:1fr; }
     }
   `;
 }

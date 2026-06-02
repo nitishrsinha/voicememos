@@ -1,6 +1,8 @@
 # Voice Memos
 
-Personal transcript-only voice memo PWA.
+Private voice diary for thoughts, todos, and reflections. It records in the
+browser, transcribes through a Cloudflare Worker, stores only transcripts, and
+turns entries into a searchable diary with categories and evening digests.
 
 ## What It Does
 
@@ -10,15 +12,26 @@ Personal transcript-only voice memo PWA.
 - Transcribes with Workers AI `@cf/openai/whisper`
 - Discards audio immediately
 - Stores only transcript metadata in D1
+- Organizes older entries into a Diary tab grouped by year, month, and day
+- Supports transcript and category editing
+- Searches diary entries by text, category, and date range
 - Sends an evening report by email
 - Supports manual text memos and "send report now"
 - Lets you compare Llama, Qwen, and Kimi for manual reports
 
-## Public Demo
-  Try the public demo:
-  https://voicememos-demo.nitish-ranjan.workers.dev
-  The demo is separate from the private self-hosted app. It does not store audio or transcript text, , but it processes recordings through Cloudflare Workers AI and records anonymous usage events such as page views, transcription attempts, and report preview generation. Do not record sensitive information in the demo.
-  
+## Screenshots
+
+Today view for capture, manual notes, and report actions:
+
+![Today view](helpers/Screenshot%202026-06-01%20222956.png)
+
+Diary view with search, category, and date filters:
+
+![Diary view](helpers/Screenshot%202026-06-01%20223305.png)
+
+Password and authenticator login:
+
+![Login view](helpers/Screenshot%202026-06-01%20223326.png)
 
 ## Security Model
 
@@ -95,7 +108,7 @@ npm run deploy
 
 ## Notes
 
-The app does not save audio. The audio blob is sent to the Worker, passed to Whisper, and then discarded. Only the transcript, mode, timestamp, and optional duration are stored.
+The app does not save audio. The audio blob is sent to the Worker, passed to Whisper, and then discarded. Only the transcript, category, timestamp, and optional duration are stored.
 
 The scheduled report cron runs every 30 minutes and sends only when the local hour matches `REPORT_HOUR_LOCAL`. It skips if a report has already been sent for that local date unless you click "Send today's report now."
 
@@ -125,3 +138,16 @@ SUMMARY_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
 ```
 
 Manual reports can still be sent with Llama, Qwen, or Kimi from the UI.
+
+## Copyright and License
+
+Copyright (c) 2026 Nitish R. Sinha.
+
+This repository is currently released under the MIT License, which is permissive:
+others may use, copy, modify, publish, distribute, sublicense, and sell copies of
+the software as long as they preserve the copyright and license notice.
+
+If you want stronger control over reuse, replace the MIT License with a
+source-available or proprietary license before treating the repository as a
+public project. Copyright can protect the source code and written materials, but
+it does not protect the underlying idea, workflow, or product concept.
