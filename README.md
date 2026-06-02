@@ -14,6 +14,12 @@ Personal transcript-only voice memo PWA.
 - Supports manual text memos and "send report now"
 - Lets you compare Llama, Qwen, and Kimi for manual reports
 
+## Public Demo
+  Try the public demo:
+  https://voicememos-demo.nitish-ranjan.workers.dev
+  The demo is separate from the private self-hosted app. It does not store audio or transcript text, , but it processes recordings through Cloudflare Workers AI and records anonymous usage events such as page views, transcription attempts, and report preview generation. Do not record sensitive information in the demo.
+  
+
 ## Security Model
 
 This is designed for a single owner, not public signups.
