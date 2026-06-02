@@ -689,6 +689,8 @@ function appPage(env) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f7f3ed">
   <title>${escapeHtml(env.APP_NAME || "Voice Memos")}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
   <style>${styles()}</style>
 </head>
 <body>
@@ -951,6 +953,47 @@ function appPage(env) {
       var match = modeOptions.find(function (option) { return option[0] === value; });
       return match ? match[1] : "Free note";
     }
+    function appendTextWithBreaks(container, value) {
+      String(value || "").split("\\n").forEach(function (line, index) {
+        if (index) container.appendChild(document.createElement("br"));
+        container.appendChild(document.createTextNode(line));
+      });
+    }
+    function appendMath(container, source, displayMode) {
+      if (!window.katex) {
+        appendTextWithBreaks(container, displayMode ? "$$" + source + "$$" : "$" + source + "$");
+        return;
+      }
+      try {
+        var wrapper = document.createElement(displayMode ? "div" : "span");
+        wrapper.className = displayMode ? "memo-math-block" : "memo-math-inline";
+        katex.render(source, wrapper, {
+          displayMode: displayMode,
+          throwOnError: false,
+          strict: "warn"
+        });
+        container.appendChild(wrapper);
+      } catch (error) {
+        appendTextWithBreaks(container, displayMode ? "$$" + source + "$$" : "$" + source + "$");
+      }
+    }
+    function renderTranscript(container, value) {
+      var text = String(value || "");
+      container.innerHTML = "";
+      var pattern = /(\\$\\$[\\s\\S]+?\\$\\$|\\$[^$\\n]+?\\$)/g;
+      var lastIndex = 0;
+      var match;
+      while ((match = pattern.exec(text)) !== null) {
+        appendTextWithBreaks(container, text.slice(lastIndex, match.index));
+        var token = match[0];
+        var displayMode = token.startsWith("$$");
+        var source = displayMode ? token.slice(2, -2).trim() : token.slice(1, -1).trim();
+        if (source) appendMath(container, source, displayMode);
+        else appendTextWithBreaks(container, token);
+        lastIndex = pattern.lastIndex;
+      }
+      appendTextWithBreaks(container, text.slice(lastIndex));
+    }
     async function updateMemo(id, transcript, mode) {
       var response = await fetch("/api/memos/" + encodeURIComponent(id), {
         method: "PATCH",
@@ -996,10 +1039,10 @@ function appPage(env) {
       head.appendChild(actions);
 
       var transcript = document.createElement("p");
-      transcript.textContent = memo.transcript || "";
 
       article.appendChild(head);
       article.appendChild(transcript);
+      renderTranscript(transcript, memo.transcript || "");
       return article;
     }
     function renderMemoList(container, memos, emptyText) {
@@ -1133,7 +1176,7 @@ function appPage(env) {
           var memo = await updateMemo(article.dataset.id, updated, category.value);
           article.dataset.transcript = memo.transcript || updated;
           article.dataset.mode = memo.mode || category.value;
-          body.textContent = article.dataset.transcript;
+          renderTranscript(body, article.dataset.transcript);
           article.querySelector(".memo-mode").textContent = modeLabel(article.dataset.mode);
           setStatus("Memo updated", "ok");
           finishEditingMemo(article, body, actions);
@@ -1250,6 +1293,8 @@ function styles() {
     .memo-head .memo-delete, .memo-head .memo-cancel { color:var(--danger); }
     .memo-category { margin:10px 0 0; }
     .memo-editor { min-height:120px; margin:10px 0 0; }
+    .memo-math-inline { white-space:normal; }
+    .memo-math-block { display:block; overflow-x:auto; margin:10px 0; padding:2px 0; }
     .diary-header { border-bottom:1px solid var(--line); padding-bottom:12px; }
     .diary-header p { margin:4px 0 0; color:var(--muted); }
     .diary-filters { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px; align-items:end; padding:12px 0 4px; border-bottom:1px solid var(--line); }

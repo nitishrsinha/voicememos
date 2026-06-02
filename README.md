@@ -15,6 +15,7 @@ turns entries into a searchable diary with categories and evening digests.
 - Organizes older entries into a Diary tab grouped by year, month, and day
 - Supports transcript and category editing
 - Searches diary entries by text, category, and date range
+- Renders LaTeX equations in saved entries
 - Sends an evening report by email
 - Supports manual text memos and "send report now"
 - Lets you compare Llama, Qwen, and Kimi for manual reports
@@ -29,9 +30,28 @@ Diary view with search, category, and date filters:
 
 ![Diary view](helpers/Screenshot%202026-06-01%20223305.png)
 
+Journal entry with rendered LaTeX:
+
+![LaTeX journal entry](helpers/Screenshot%202026-06-01%20231545.png)
+
 Password and authenticator login:
 
 ![Login view](helpers/Screenshot%202026-06-01%20223326.png)
+
+## Writing Math
+
+Entries can include LaTeX equations. Use `$...$` for inline math and `$$...$$`
+for display math:
+
+```latex
+Inline: $\Delta x = \alpha + \beta r_t + \epsilon_t$
+
+$$
+\pi_t=(1-\phi)\mu+\phi \pi_{t-1}+\eta_t
+$$
+```
+
+The app stores the raw text and renders equations when entries are displayed.
 
 ## Security Model
 
