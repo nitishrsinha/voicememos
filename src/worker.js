@@ -258,11 +258,15 @@ async function handleAsk(request, env) {
 
   const filters = {
     q: question,
-    mode: MODES.has(String(body.mode || "")) ? String(body.mode) : "",
-    from: parseIsoDateParam(body.from),
-    to: parseIsoDateParam(body.to),
+    mode: "",
+    from: "",
+    to: "",
   };
-  const sources = await listAskSourceMemos(env, todayLocal(env), filters, 12);
+  const sources = await listAskSourceMemos(env, filters, 12);
+  console.log("Ask retrieval", {
+    terms: askSearchTerms(question),
+    source_count: sources.length,
+  });
   if (!sources.length) {
     return json({
       ok: true,
@@ -304,9 +308,15 @@ async function synthesizeAskAnswer(env, question, sources, model) {
           { role: "user", content: prompt },
         ],
       });
-      const text = String(result?.response || result?.text || "").trim();
+      const text = extractAiText(result);
       if (text) return text;
-    } catch {
+      console.error("Ask synthesis returned empty", {
+        model,
+        result_keys: result && typeof result === "object" ? Object.keys(result) : [],
+        result_type: typeof result,
+      });
+    } catch (error) {
+      console.error("Ask synthesis failed", error?.stack || error?.message || error);
       // Fall through to source summary.
     }
   }
@@ -315,6 +325,23 @@ async function synthesizeAskAnswer(env, question, sources, model) {
     `I found ${sources.length} matching diary entr${sources.length === 1 ? "y" : "ies"}, but could not synthesize an AI answer.`,
     "Review the sources below for the underlying notes.",
   ].join(" ");
+}
+
+function extractAiText(result) {
+  const candidates = [
+    result?.response,
+    result?.text,
+    result?.result?.response,
+    result?.result?.text,
+    result?.choices?.[0]?.message?.content,
+    result?.choices?.[0]?.text,
+  ];
+  for (const candidate of candidates) {
+    const text = String(candidate || "").trim();
+    if (text) return text;
+  }
+  if (typeof result === "string") return result.trim();
+  return "";
 }
 
 async function maybeSendScheduledReport(env) {
@@ -398,7 +425,7 @@ async function buildReport(env, reportDate, memos, model = null) {
           { role: "user", content: prompt },
         ],
       });
-      const text = String(result?.response || result?.text || "").trim();
+      const text = extractAiText(result);
       if (text) return text;
     } catch {
       // Fall through to the deterministic report.
@@ -508,32 +535,43 @@ async function listDiaryMemosFts(env, beforeDate, filters, ftsQuery) {
   return results || [];
 }
 
-async function listAskSourceMemos(env, beforeDate, filters, limit) {
-  const ftsQuery = buildFtsQuery(filters.q);
+async function listAskSourceMemos(env, filters, limit) {
+  const askTerms = askSearchTerms(filters.q);
+  if (!askTerms.length) return [];
+
+  const ftsQuery = buildAskFtsQuery(askTerms);
   if (ftsQuery) {
     try {
-      return await listAskSourceMemosFts(env, beforeDate, filters, ftsQuery, limit);
+      const ftsResults = await listAskSourceMemosFts(env, filters, ftsQuery, limit);
+      if (ftsResults.length) return ftsResults;
     } catch {
       // Fall back to LIKE for punctuation-heavy or LaTeX-heavy questions.
     }
   }
 
-  const clauses = ["local_date < ?", "transcript LIKE ? ESCAPE '\\\\'"];
-  const values = [beforeDate, `%${escapeSqlLike(filters.q)}%`];
+  const clauses = [];
+  const values = [];
+  clauses.push("(" + askTerms.map(() => "transcript LIKE ? ESCAPE '\\\\'").join(" OR ") + ")");
+  askTerms.forEach((term) => values.push(`%${escapeSqlLike(term)}%`));
   appendMemoFilters(clauses, values, filters, "");
-  const { results } = await env.DB.prepare(`
-    SELECT id, created_at, local_date, transcript, duration_seconds, mode, source, included_in_report_id
-    FROM voice_memos
-    WHERE ${clauses.join(" AND ")}
-    ORDER BY local_date DESC, created_at DESC
-    LIMIT ?
-  `).bind(...values, limit).all();
-  return results || [];
+  try {
+    const { results } = await env.DB.prepare(`
+      SELECT id, created_at, local_date, transcript, duration_seconds, mode, source, included_in_report_id
+      FROM voice_memos
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY local_date DESC, created_at DESC
+      LIMIT ?
+    `).bind(...values, limit).all();
+    if (results && results.length) return results;
+    return listAskSourceMemosByScore(env, filters, limit, askTerms);
+  } catch {
+    return listAskSourceMemosByScore(env, filters, limit, askTerms);
+  }
 }
 
-async function listAskSourceMemosFts(env, beforeDate, filters, ftsQuery, limit) {
-  const clauses = ["vm.local_date < ?", "voice_memos_fts MATCH ?"];
-  const values = [beforeDate, ftsQuery];
+async function listAskSourceMemosFts(env, filters, ftsQuery, limit) {
+  const clauses = [`voice_memos_fts MATCH ${sqlStringLiteral(ftsQuery)}`];
+  const values = [];
   appendMemoFilters(clauses, values, filters, "vm.");
   const { results } = await env.DB.prepare(`
     SELECT vm.id, vm.created_at, vm.local_date, vm.transcript, vm.duration_seconds, vm.mode, vm.source, vm.included_in_report_id
@@ -544,6 +582,35 @@ async function listAskSourceMemosFts(env, beforeDate, filters, ftsQuery, limit) 
     LIMIT ?
   `).bind(...values, limit).all();
   return results || [];
+}
+
+async function listAskSourceMemosByScore(env, filters, limit, terms) {
+  const clauses = [];
+  const values = [];
+  appendMemoFilters(clauses, values, filters, "");
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const { results } = await env.DB.prepare(`
+    SELECT id, created_at, local_date, transcript, duration_seconds, mode, source, included_in_report_id
+    FROM voice_memos
+    ${where}
+    ORDER BY local_date DESC, created_at DESC
+    LIMIT 500
+  `).bind(...values).all();
+
+  return (results || [])
+    .map((memo) => ({
+      memo,
+      score: scoreMemoForTerms(memo, terms),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || String(b.memo.created_at).localeCompare(String(a.memo.created_at)))
+    .slice(0, limit)
+    .map((item) => item.memo);
+}
+
+function scoreMemoForTerms(memo, terms) {
+  const haystack = `${memo.transcript || ""} ${memo.mode || ""}`.toLowerCase();
+  return terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
 }
 
 function appendMemoFilters(clauses, values, filters, prefix) {
@@ -562,11 +629,35 @@ function appendMemoFilters(clauses, values, filters, prefix) {
 }
 
 function buildFtsQuery(value) {
-  const terms = String(value || "")
-    .toLowerCase()
-    .match(/[\\p{L}\\p{N}_]+/gu);
+  const terms = searchTerms(value);
   if (!terms || !terms.length) return "";
-  return terms.slice(0, 8).map((term) => `"${term.replaceAll('"', '""')}"`).join(" AND ");
+  return terms.slice(0, 8).map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR ");
+}
+
+function buildAskFtsQuery(terms) {
+  return terms.slice(0, 6).map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR ");
+}
+
+function sqlStringLiteral(value) {
+  return `'${String(value || "").replaceAll("'", "''")}'`;
+}
+
+function searchTerms(value) {
+  return String(value || "")
+    .toLowerCase()
+    .match(/[\p{L}\p{N}_]+/gu) || [];
+}
+
+function askSearchTerms(value) {
+  const stopwords = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does",
+    "for", "from", "had", "has", "have", "how", "i", "in", "is", "it", "me",
+    "my", "of", "on", "or", "the", "to", "was", "were", "what", "when", "where",
+    "who", "why", "with", "about", "feel", "felt"
+  ]);
+  return searchTerms(value)
+    .filter((term) => term.length > 1 && !stopwords.has(term))
+    .slice(0, 8);
 }
 
 function escapeSqlLike(value) {
@@ -575,7 +666,7 @@ function escapeSqlLike(value) {
 
 function parseIsoDateParam(value) {
   const date = String(value || "").trim();
-  return /^\\d{4}-\\d{2}-\\d{2}$/.test(date) ? date : "";
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
 }
 
 async function sendEmail(env, { to, subject, text }) {
@@ -1023,6 +1114,10 @@ function appPage(env) {
     var diaryFromEl = document.getElementById("diaryFrom");
     var diaryToEl = document.getElementById("diaryTo");
     var clearDiaryFiltersBtn = document.getElementById("clearDiaryFilters");
+    var askQuestionEl = document.getElementById("askQuestion");
+    var askDiaryBtn = document.getElementById("askDiary");
+    var clearAskBtn = document.getElementById("clearAsk");
+    var askResultEl = document.getElementById("askResult");
     var tabs = document.querySelectorAll(".tab");
     var views = {
       today: document.getElementById("todayView"),
@@ -1082,6 +1177,12 @@ function appPage(env) {
       diaryFromEl.value = "";
       diaryToEl.value = "";
       loadDiary();
+    });
+    askDiaryBtn.addEventListener("click", askDiary);
+    clearAskBtn.addEventListener("click", function () {
+      askQuestionEl.value = "";
+      askResultEl.hidden = true;
+      askResultEl.innerHTML = "";
     });
     async function startRecording() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -1469,6 +1570,56 @@ function appPage(env) {
       var data = await response.json();
       renderDiary(data.memos);
     }
+    async function askDiary() {
+      var question = askQuestionEl.value.trim();
+      if (!question) {
+        setStatus("Ask a question first.", "error");
+        askQuestionEl.focus();
+        return;
+      }
+      askDiaryBtn.disabled = true;
+      askResultEl.hidden = false;
+      askResultEl.innerHTML = '<p class="empty">Thinking...</p>';
+      try {
+        var response = await fetch("/api/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question: question
+          })
+        });
+        var data = await response.json().catch(function () { return {}; });
+        if (!response.ok) throw new Error(data.error || "Ask failed.");
+        renderAskResult(data.answer || "", data.sources || []);
+        setStatus("Answer ready", "ok");
+      } catch (error) {
+        askResultEl.innerHTML = '<p class="empty">' + escapeClientHtml(error.message || "Ask failed.") + '</p>';
+        setStatus(error.message || "Ask failed.", "error");
+      } finally {
+        askDiaryBtn.disabled = false;
+      }
+    }
+    function renderAskResult(answer, sources) {
+      askResultEl.innerHTML = "";
+      var answerBlock = document.createElement("div");
+      answerBlock.className = "ask-answer";
+      appendTextWithBreaks(answerBlock, answer || "No answer returned.");
+      askResultEl.appendChild(answerBlock);
+
+      if (sources.length) {
+        var heading = document.createElement("h3");
+        heading.textContent = "Sources";
+        askResultEl.appendChild(heading);
+        sources.forEach(function (memo) {
+          askResultEl.appendChild(createMemoArticle(memo));
+        });
+      }
+    }
+    function escapeClientHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, function (ch) {
+        return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[ch];
+      });
+    }
     function diaryEmptyText() {
       if (diarySearchEl.value.trim() || diaryModeEl.value || diaryFromEl.value || diaryToEl.value) {
         return "No diary entries match those filters.";
@@ -1528,6 +1679,14 @@ function styles() {
     .memo-math-block { display:block; overflow-x:auto; margin:10px 0; padding:2px 0; }
     .diary-header { border-bottom:1px solid var(--line); padding-bottom:12px; }
     .diary-header p { margin:4px 0 0; color:var(--muted); }
+    .ask-panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; display:grid; gap:10px; }
+    .ask-panel label { display:grid; gap:6px; }
+    .ask-panel span { color:var(--muted); font-size:.82rem; font-weight:700; }
+    .ask-panel textarea { min-height:86px; margin:0; }
+    .ask-actions { display:flex; gap:10px; flex-wrap:wrap; }
+    .ask-result { border-top:1px solid var(--line); padding-top:12px; display:grid; gap:12px; }
+    .ask-answer { line-height:1.55; background:white; border:1px solid var(--line); border-radius:8px; padding:12px; }
+    .ask-result h3 { margin:2px 0 0; color:var(--muted); font-size:.9rem; }
     .diary-filters { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px; align-items:end; padding:12px 0 4px; border-bottom:1px solid var(--line); }
     .diary-filters label { display:grid; gap:5px; }
     .diary-filters span { color:var(--muted); font-size:.78rem; font-weight:700; }
