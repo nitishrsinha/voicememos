@@ -36,6 +36,10 @@ async function routeRequest(request, env, ctx) {
     return redirect("/login", clearSessionCookie());
   }
 
+  if (url.pathname.startsWith("/api/external/")) {
+    return handleExternal(request, env, url);
+  }
+
   const session = await getSession(request, env);
   if (!session) {
     if (url.pathname.startsWith("/api/")) {
@@ -152,6 +156,7 @@ async function handleTextMemo(request, env) {
     mode: normalizeMode(body.mode),
     duration_seconds: null,
     source: "text",
+    tags: body.tags,
   });
   return json({ ok: true, memo });
 }
@@ -188,17 +193,18 @@ async function handleUpdateMemo(request, env, id) {
   const transcript = String(body.transcript || "").trim();
   if (!transcript) return json({ error: "Memo text is required." }, 400);
   const mode = normalizeMode(body.mode);
+  const tags = normalizeTags(body.tags);
 
   const result = await env.DB.prepare(
-    "UPDATE voice_memos SET transcript = ?, mode = ? WHERE id = ?"
-  ).bind(transcript, mode, id).run();
+    "UPDATE voice_memos SET transcript = ?, mode = ?, tags = ? WHERE id = ?"
+  ).bind(transcript, mode, tags, id).run();
 
   if (!(result.meta?.changes || 0)) {
     return json({ error: "Memo not found." }, 404);
   }
 
   const memo = await env.DB.prepare(`
-    SELECT id, created_at, local_date, transcript, duration_seconds, mode, source, included_in_report_id
+    SELECT id, created_at, local_date, transcript, duration_seconds, mode, source, included_in_report_id, tags
     FROM voice_memos
     WHERE id = ?
     LIMIT 1
@@ -223,13 +229,67 @@ async function handleDeleteDay(env) {
   return json({ ok: true, local_date: localDate, deleted: result.meta?.changes || 0 });
 }
 
-async function insertMemo(env, { transcript, mode, duration_seconds, source }) {
+async function handleExternal(request, env, url) {
+  const auth = String(request.headers.get("Authorization") || "");
+  const key = String(env.VOICE_EXTERNAL_KEY || "");
+  if (!key || auth !== `Bearer ${key}`) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  if (url.pathname === "/api/external/memos/today" && request.method === "GET") {
+    const localDate = todayLocal(env);
+    const memos = await listMemosForDate(env, localDate);
+    return json({ ok: true, local_date: localDate, memos });
+  }
+
+  if (url.pathname === "/api/external/memos" && request.method === "GET") {
+    const memos = await listDiaryMemos(env, "9999-12-31", parseDiaryFilters(url));
+    return json({ ok: true, memos });
+  }
+
+  if (url.pathname === "/api/external/links" && request.method === "GET") {
+    const folder = String(url.searchParams.get("folder") ?? "").trim().slice(0, 60);
+    const { results } = await env.DB.prepare(
+      "SELECT id, created_at, url, label, folder FROM links WHERE folder = ? ORDER BY created_at DESC"
+    ).bind(folder).all();
+    return json({ ok: true, links: results || [] });
+  }
+
+  if (url.pathname === "/api/external/links" && request.method === "POST") {
+    let body = {};
+    try { body = await request.json(); } catch { return json({ error: "Invalid JSON." }, 400); }
+    const linkUrl = String(body.url || "").trim();
+    const label = String(body.label || "").trim();
+    const folder = String(body.folder ?? "").trim().slice(0, 60);
+    if (!linkUrl) return json({ error: "url is required." }, 400);
+    if (!label) return json({ error: "label is required." }, 400);
+    if (!/^https?:\/\//.test(linkUrl)) return json({ error: "url must start with http:// or https://" }, 400);
+    const id = crypto.randomUUID();
+    const created_at = new Date().toISOString();
+    await env.DB.prepare(
+      "INSERT INTO links (id, created_at, url, label, folder) VALUES (?, ?, ?, ?, ?)"
+    ).bind(id, created_at, linkUrl, label, folder).run();
+    return json({ ok: true, link: { id, created_at, url: linkUrl, label, folder } });
+  }
+
+  if (url.pathname.startsWith("/api/external/links/") && request.method === "DELETE") {
+    const id = decodeURIComponent(url.pathname.slice("/api/external/links/".length));
+    if (!id) return json({ error: "id is required." }, 400);
+    const result = await env.DB.prepare("DELETE FROM links WHERE id = ?").bind(id).run();
+    return json({ ok: true, deleted: result.meta?.changes || 0 });
+  }
+
+  return new Response("Not found", { status: 404 });
+}
+
+async function insertMemo(env, { transcript, mode, duration_seconds, source, tags }) {
   const now = new Date().toISOString();
   const localDate = localDateFor(new Date(), env);
   const id = crypto.randomUUID();
+  const normalizedTags = normalizeTags(tags);
   await env.DB.prepare(`
-    INSERT INTO voice_memos (id, created_at, local_date, transcript, duration_seconds, mode, source)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO voice_memos (id, created_at, local_date, transcript, duration_seconds, mode, source, tags)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
     id,
     now,
@@ -237,12 +297,18 @@ async function insertMemo(env, { transcript, mode, duration_seconds, source }) {
     transcript,
     duration_seconds,
     mode,
-    source
+    source,
+    normalizedTags
   ).run();
 
-  const memo = { id, created_at: now, local_date: localDate, transcript, duration_seconds, mode, source };
+  const memo = { id, created_at: now, local_date: localDate, transcript, duration_seconds, mode, source, tags: normalizedTags };
   await upsertMemoFts(env, memo);
   return memo;
+}
+
+function normalizeTags(value) {
+  if (!value) return "";
+  return String(value).split(",").map((t) => t.trim()).filter(Boolean).join(",");
 }
 
 async function handleAsk(request, env) {
@@ -700,6 +766,8 @@ async function ensureSchema(env) {
       included_in_report_id TEXT
     )
   `).run();
+  // tags column added in migration 0003; silent no-op if already present
+  await env.DB.prepare("ALTER TABLE voice_memos ADD COLUMN tags TEXT NOT NULL DEFAULT ''").run().catch(() => {});
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS daily_reports (
       id TEXT PRIMARY KEY,
@@ -732,6 +800,18 @@ async function ensureSchema(env) {
       SELECT 1 FROM voice_memos_fts WHERE memo_id = voice_memos.id
     )
   `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS links (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      url TEXT NOT NULL,
+      label TEXT NOT NULL,
+      folder TEXT NOT NULL DEFAULT ''
+    )
+  `).run();
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_links_folder ON links(folder)"
+  ).run();
 }
 
 async function upsertMemoFts(env, memo) {
@@ -1036,6 +1116,7 @@ function appPage(env) {
 
       <div class="manual">
         <textarea id="textMemo" placeholder="Type a memo if recording is not convenient"></textarea>
+        <input type="text" id="textTags" placeholder="Tags (comma-separated, e.g. ChatGPT,research)">
         <button id="saveText" type="button">Save text memo</button>
       </div>
 
@@ -1245,15 +1326,17 @@ function appPage(env) {
     });
     document.getElementById("saveText").addEventListener("click", async function () {
       var textarea = document.getElementById("textMemo");
+      var tagsInput = document.getElementById("textTags");
       var text = textarea.value.trim();
       if (!text) return;
       var response = await fetch("/api/memos/text", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: text, mode: modeEl.value })
+        body: JSON.stringify({ transcript: text, mode: modeEl.value, tags: tagsInput.value.trim() })
       });
       if (response.ok) {
         textarea.value = "";
+        tagsInput.value = "";
         loadAllMemos();
       }
     });
@@ -1326,11 +1409,11 @@ function appPage(env) {
       }
       appendTextWithBreaks(container, text.slice(lastIndex));
     }
-    async function updateMemo(id, transcript, mode) {
+    async function updateMemo(id, transcript, mode, tags) {
       var response = await fetch("/api/memos/" + encodeURIComponent(id), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: transcript, mode: mode })
+        body: JSON.stringify({ transcript: transcript, mode: mode, tags: tags || "" })
       });
       var data = await response.json().catch(function () { return {}; });
       if (!response.ok) throw new Error(data.error || "Could not update memo.");
@@ -1342,6 +1425,7 @@ function appPage(env) {
       article.dataset.id = memo.id || "";
       article.dataset.transcript = memo.transcript || "";
       article.dataset.mode = memo.mode || "free";
+      article.dataset.tags = memo.tags || "";
 
       var head = document.createElement("div");
       head.className = "memo-head";
@@ -1368,6 +1452,12 @@ function appPage(env) {
       actions.appendChild(edit);
       actions.appendChild(del);
       head.appendChild(mode);
+      if (memo.tags) {
+        var tagsEl = document.createElement("span");
+        tagsEl.className = "memo-tags";
+        tagsEl.textContent = memo.tags;
+        head.appendChild(tagsEl);
+      }
       head.appendChild(actions);
 
       var transcript = document.createElement("p");
@@ -1465,11 +1555,14 @@ function appPage(env) {
       if (article.classList.contains("is-editing")) return;
       var text = article.dataset.transcript || "";
       var currentMode = article.dataset.mode || "free";
+      var currentTags = article.dataset.tags || "";
       var body = article.querySelector("p");
       var actions = article.querySelector(".memo-actions");
 
       article.classList.add("is-editing");
       body.hidden = true;
+      var existingTagsEl = article.querySelector(".memo-tags");
+      if (existingTagsEl) existingTagsEl.hidden = true;
       actions.innerHTML = "";
 
       var category = document.createElement("select");
@@ -1485,6 +1578,12 @@ function appPage(env) {
       var textarea = document.createElement("textarea");
       textarea.className = "memo-editor";
       textarea.value = text;
+
+      var tagsInput = document.createElement("input");
+      tagsInput.type = "text";
+      tagsInput.className = "memo-tags-editor";
+      tagsInput.placeholder = "Tags (comma-separated)";
+      tagsInput.value = currentTags;
 
       var save = document.createElement("button");
       save.type = "button";
@@ -1505,9 +1604,10 @@ function appPage(env) {
         }
         save.disabled = true;
         try {
-          var memo = await updateMemo(article.dataset.id, updated, category.value);
+          var memo = await updateMemo(article.dataset.id, updated, category.value, tagsInput.value.trim());
           article.dataset.transcript = memo.transcript || updated;
           article.dataset.mode = memo.mode || category.value;
+          article.dataset.tags = memo.tags || tagsInput.value.trim();
           renderTranscript(body, article.dataset.transcript);
           article.querySelector(".memo-mode").textContent = modeLabel(article.dataset.mode);
           setStatus("Memo updated", "ok");
@@ -1526,15 +1626,29 @@ function appPage(env) {
       actions.appendChild(cancel);
       article.appendChild(category);
       article.appendChild(textarea);
+      article.appendChild(tagsInput);
       category.focus();
       textarea.setSelectionRange(textarea.value.length, textarea.value.length);
     }
     function finishEditingMemo(article, body, actions) {
       var category = article.querySelector(".memo-category");
       var editor = article.querySelector(".memo-editor");
+      var tagsEditor = article.querySelector(".memo-tags-editor");
       if (category) category.remove();
       if (editor) editor.remove();
+      if (tagsEditor) tagsEditor.remove();
       body.hidden = false;
+      var tagsEl = article.querySelector(".memo-tags");
+      if (tagsEl) {
+        tagsEl.hidden = false;
+        tagsEl.textContent = article.dataset.tags || "";
+        if (!article.dataset.tags) tagsEl.remove();
+      } else if (article.dataset.tags) {
+        var newTagsEl = document.createElement("span");
+        newTagsEl.className = "memo-tags";
+        newTagsEl.textContent = article.dataset.tags;
+        article.querySelector(".memo-head").insertBefore(newTagsEl, actions);
+      }
       article.classList.remove("is-editing");
       actions.innerHTML = "";
 
@@ -1675,6 +1789,8 @@ function styles() {
     .memo-head .memo-delete, .memo-head .memo-cancel { color:var(--danger); }
     .memo-category { margin:10px 0 0; }
     .memo-editor { min-height:120px; margin:10px 0 0; }
+    .memo-tags { font-size:.78rem; color:var(--muted); background:var(--bg); border:1px solid var(--line); border-radius:4px; padding:1px 6px; flex-shrink:0; }
+    .memo-tags-editor { margin:8px 0 0; }
     .memo-math-inline { white-space:normal; }
     .memo-math-block { display:block; overflow-x:auto; margin:10px 0; padding:2px 0; }
     .diary-header { border-bottom:1px solid var(--line); padding-bottom:12px; }
